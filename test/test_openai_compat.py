@@ -265,6 +265,76 @@ async def test_named_slot_refuses_while_stage_controller_runs():
     run_chat.assert_not_called()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handed_over", ["held", "record"])
+async def test_named_slot_handed_over_to_kiro_cli_is_refused_before_its_row(
+    tmp_path, monkeypatch, handed_over
+):
+    """Its row would land ahead of the terminal's turns, and the turn be refused."""
+    from kiro_crew import kiro_cli_handoff
+
+    monkeypatch.setattr(kiro_cli_handoff, "_records_dir", lambda: tmp_path / "opens")
+    kiro_cli_handoff.reset_holds()
+    slot = _make_slot()
+    state = _make_state(slot)
+    key = "dashboard:test-slot"
+    if handed_over == "held":
+        assert kiro_cli_handoff.hold(key, "t")
+    else:
+        kiro_cli_handoff.record_open(key, {"history_key": key, "created_at": "", "log_offset": 0})
+    request = _make_request(
+        {"id": "test-slot", "model": "kiro", "messages": [{"role": "user", "content": "hi"}]},
+        state,
+    )
+    try:
+        with patch("kiro_crew.dashboard.openai_compat._run_chat") as run_chat:
+            response = await api_completions(request)
+    finally:
+        kiro_cli_handoff.reset_holds()
+    assert response.status == 409
+    expected = "kiro_cli_open" if handed_over == "held" else "kiro_cli_import_pending"
+    assert json.loads(response.body)["code"] == expected
+    slot.append.assert_not_called()
+    run_chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handed_over", ["held", "record"])
+async def test_handover_refusal_preserves_the_openai_slot_agent(tmp_path, monkeypatch, handed_over):
+    """An agent-less slot is not bound to the request's agent by a refused send.
+    (A slot with an agent refuses a different one as a mismatch first.)"""
+    original_agent = ""
+    from kiro_crew import kiro_cli_handoff
+    from kiro_crew.dashboard.chat_utils import effective_session_key
+
+    monkeypatch.setattr(kiro_cli_handoff, "_records_dir", lambda: tmp_path / "opens")
+    kiro_cli_handoff.reset_holds()
+    slot = _make_slot()
+    slot.agent = original_agent
+    slot._slack_linked = False
+    state = _make_state(slot)
+    key = effective_session_key(slot)
+    if handed_over == "held":
+        assert kiro_cli_handoff.hold(key, "t")
+    else:
+        kiro_cli_handoff.record_open(key, {"history_key": key, "created_at": "", "log_offset": 0})
+    request = _make_request(
+        {"id": slot.key, "model": "agent-b", "messages": [{"role": "user", "content": "hi"}]},
+        state,
+    )
+    try:
+        with patch("kiro_crew.dashboard.openai_compat._run_chat") as run_chat:
+            response = await api_completions(request)
+        assert response.status == 409
+        assert slot.agent == original_agent
+        code = "kiro_cli_open" if handed_over == "held" else "kiro_cli_import_pending"
+        assert json.loads(response.body)["code"] == code
+        slot.append.assert_not_called()
+        run_chat.assert_not_called()
+    finally:
+        kiro_cli_handoff.reset_holds()
+
+
 def _make_state(slot):
     state = MagicMock()
     state.get_or_create_slot = MagicMock(return_value=slot)

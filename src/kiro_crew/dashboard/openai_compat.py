@@ -609,6 +609,25 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
     # Drain stale pending from prior turns whose reader disconnected
     slot.drain()
 
+    # A chat handed over to kiro-cli is refused before the request's agent is
+    # adopted below, so a refused request leaves the slot's agent as it was. The
+    # check before the row stays.
+    from kiro_crew.dashboard.chat_utils import effective_session_key
+    from kiro_crew.kiro_cli_handoff import handover_refusal
+
+    handed_over = handover_refusal(effective_session_key(slot))
+    if handed_over is not None:
+        message, code = handed_over
+        if slot_id and freshly_created:
+            state._slots.pop(slot.key, None)
+        return web.json_response(
+            {
+                "error": {"message": message, "type": "invalid_request_error", "code": code},
+                "code": code,
+            },
+            status=409,
+        )
+
     if agent:
         if slot.mode == "member" and agent != slot.agent:
             # Member DM threads are pinned to their crew. Only an EXISTING slot
@@ -666,6 +685,21 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                     status=409,
                 )
         slot.agent = agent
+    # A chat handed over to kiro-cli (``kiro_crew.kiro_cli_handoff``): this row
+    # would land ahead of the terminal's turns and its turn be refused. Checked
+    # with no await before the row (one stat).
+    handed_over = handover_refusal(effective_session_key(slot))
+    if handed_over is not None:
+        message, code = handed_over
+        if slot_id and freshly_created:
+            state._slots.pop(slot.key, None)
+        return web.json_response(
+            {
+                "error": {"message": message, "type": "invalid_request_error", "code": code},
+                "code": code,
+            },
+            status=409,
+        )
     # A hold a restart restored into this idle slot is owed to this turn.
     flush_restored_hold(slot, logger=logger)
     slot.append("user", prompt, "msg msg-u")
