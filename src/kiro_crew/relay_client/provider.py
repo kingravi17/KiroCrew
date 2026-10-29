@@ -37,8 +37,8 @@ from kiro_crew.relay_client.lease import (
 )
 from kiro_crew.relay_client.protocol import (
     CREW_HOST_RE,
+    MOVE_QUIET_GRACE_MAX_SECONDS,
     MOVE_QUIET_GRACE_SECONDS,
-    MOVE_WINDOW_MAX_SECONDS,
     WS_MESSAGE_MAX_BYTES,
     host_url_problem,
     is_loopback_host,
@@ -99,7 +99,7 @@ class RelaySettings:
                 getattr(tunnel, "relay_move_grace_seconds", MOVE_QUIET_GRACE_SECONDS),
                 MOVE_QUIET_GRACE_SECONDS,
                 0.0,
-                float(MOVE_WINDOW_MAX_SECONDS),
+                MOVE_QUIET_GRACE_MAX_SECONDS,
             ),
             lease_url=_setting_text(tunnel, "relay_lease_url"),
             lease_credential=_setting_text(tunnel, "relay_lease_credential"),
@@ -149,29 +149,28 @@ def _setting_text(tunnel: Any, name: str) -> str:
 def gateway_listener() -> tuple[str, int]:
     """The gateway's own loopback TCP listener, as the relay client dials it.
 
-    The port is the one the gateway exported once it bound (``KIROCREW_BOUND_PORT``),
-    which is the truth even under ``--port auto``. The dashboard's relay ingress
-    honours a hand-off only over loopback TCP, so a gateway bound to one specific
-    non-loopback address cannot serve the relay and is refused here.
+    Both halves come from the socket the gateway actually bound, never from the
+    address it was asked for (``KIROCREW_BIND``), which the bind policy may have
+    refused. The listener exports them together once it binds:
+    ``KIROCREW_BOUND_PORT``, the truth even under ``--port auto``, and
+    ``KIROCREW_BOUND_HOST``, absent for an IPv4 loopback or wildcard bind (reached
+    at 127.0.0.1), ``::1`` for an IPv6 one, else the specific address bound.
+    The dashboard's relay ingress honours a hand-off only over loopback TCP, so a
+    gateway bound to one specific non-loopback address cannot serve the relay and
+    is refused here.
     """
     raw = os.environ.get("KIROCREW_BOUND_PORT", "").strip()
     if not raw.isdigit() or not 0 < int(raw) < 65536:
         raise RelaySettingsError("the gateway's bound port is not known yet")
-    bind = os.environ.get("KIROCREW_BIND", "").strip()
-    if not bind or bind in ("*", "localhost"):
-        return "127.0.0.1", int(raw)
-    host = bind[1:-1] if bind.startswith("[") and bind.endswith("]") else bind
+    host = os.environ.get("KIROCREW_BOUND_HOST", "").strip() or "127.0.0.1"
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        pass
-    else:
-        if address.is_unspecified:
-            return ("127.0.0.1" if address.version == 4 else "::1"), int(raw)
-        if is_loopback_host(host):
-            return str(address), int(raw)
+        address = None
+    if address is not None and is_loopback_host(host):
+        return str(address), int(raw)
     raise RelaySettingsError(
-        f"the relay hands requests over loopback, but KIROCREW_BIND names {bind!r}"
+        f"the relay hands requests over loopback, but the gateway is bound to {host!r}"
     )
 
 
