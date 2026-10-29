@@ -26,11 +26,13 @@ from relay_client_helpers import (
     OWNER,
     FakeCrew,
     FakeRelay,
+    RecordingSleep,
     TopRng,
     fixture,
     make_client,
     ready_frame,
     stop,
+    valid_message,
 )
 
 from kiro_crew.platform_compat import IS_POSIX
@@ -1168,3 +1170,106 @@ async def test_an_external_idp_credential_sends_its_token_type(
     for refused in ("API_KEY", "SSO_OIDC", "external_idp", ""):
         with pytest.raises(ValueError):
             make_source(lease, tmp_path, clock, token_type=refused)
+
+
+# ── a spent host token is never dialed again ──
+
+
+def _count_lease_calls(source: LeaseHostTokenSource) -> List[int]:
+    """Count every call the source makes to the lease service, reached or not."""
+    calls: List[int] = []
+    post = source._post
+
+    async def counted(credential: str, body: dict):
+        calls.append(1)
+        return await post(credential, body)
+
+    source._post = counted  # type: ignore[method-assign]
+    return calls
+
+
+async def _connected_then_unreachable(lease: FakeLeaseService, relay: FakeRelay, client, clock):
+    """Connect on the lease's first token, then spend it and take the lease service away."""
+    leg = await relay.next_leg()
+    await leg.handshake()
+    await async_wait_until(client.relay_connected)
+    # The token's own lifetime passes, the relay stops taking it, and the lease
+    # service goes away.
+    clock.now += 600
+    relay.tokens.clear()
+    await lease.__aexit__()
+    return leg
+
+
+@pytest.mark.parametrize("end", ["4403", "1006"])
+async def test_a_spent_host_token_is_not_dialed_while_renewals_fail(
+    lease: FakeLeaseService, tmp_path: Path, clock: StepClock, end: str
+) -> None:
+    first = answer(0)["hostToken"]
+    async with FakeRelay(tokens={first}) as relay, FakeCrew() as crew:
+        lease.queue(200, answer(0, hostUrl=relay.url))
+        source = make_source(lease, tmp_path, clock)
+        calls = _count_lease_calls(source)
+        # The client's own history is bounded; the sleep keeps every cycle.
+        sleep = RecordingSleep()
+        client, _, ingress = make_client(
+            relay, crew, source=source, sleep=sleep  # type: ignore[arg-type]
+        )
+        await client.start()
+        try:
+            leg = await _connected_then_unreachable(lease, relay, client, clock)
+            assert len(calls) == 1
+            if end == "4403":
+                await leg.close(4403)
+            else:
+                leg.abort()
+            # Many backoff cycles pass on the client's own clock while the lease
+            # service's hold runs on the source's: no dial, and one lease call.
+            await async_wait_until(lambda: len(sleep.delays) >= 8)
+            assert relay.dials == 1 and relay.refused == []
+            assert len(calls) == 2
+            snapshot = client.snapshot()
+            assert snapshot["state"] == "reconnecting"
+            assert "lease service could not be reached" in snapshot["error"]
+
+            # Once the hold runs out, the next cycle asks once more, and only once.
+            clock.now += 3600
+            await async_wait_until(lambda: len(calls) == 3)
+            seen = len(sleep.delays)
+            await async_wait_until(lambda: len(sleep.delays) >= seen + 8)
+            assert len(calls) == 3
+            assert relay.dials == 1 and relay.refused == []
+        finally:
+            await stop(client, ingress)
+            await source.aclose()
+
+
+async def test_a_move_with_no_usable_host_token_keeps_the_old_connection(
+    lease: FakeLeaseService, tmp_path: Path, clock: StepClock
+) -> None:
+    first = answer(0)["hostToken"]
+    async with FakeRelay(tokens={first}) as relay, FakeCrew() as crew:
+        lease.queue(200, answer(0, hostUrl=relay.url))
+        source = make_source(lease, tmp_path, clock)
+        calls = _count_lease_calls(source)
+        client, _, ingress = make_client(
+            relay, crew, source=source, sleep=RecordingSleep()  # type: ignore[arg-type]
+        )
+        await client.start()
+        try:
+            leg = await _connected_then_unreachable(lease, relay, client, clock)
+            (conn,) = list(client._live)
+            await leg.send(valid_message("frames/reconnect", 0))
+            # No dial with the old connection's spent token: the old one serves on.
+            await async_wait_until(lambda: len(calls) == 2)
+            await async_wait_until(lambda: not conn.move_requested.is_set())
+            assert relay.dials == 1 and not leg.closed.is_set()
+            # The relay's 1012 ends it; the loop then waits on the source, not a dial.
+            await leg.close(1012)
+            await async_wait_until(lambda: len(client.delays) >= 8)
+            assert relay.dials == 1 and relay.refused == []
+            assert len(calls) == 2
+            assert "lease service could not be reached" in client.snapshot()["error"]
+        finally:
+            await stop(client, ingress)
+            await source.aclose()

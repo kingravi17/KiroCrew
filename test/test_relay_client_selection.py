@@ -270,49 +270,60 @@ class TestSettings:
 
     def test_the_gateway_listener_comes_from_the_bound_port(self, monkeypatch) -> None:
         monkeypatch.setenv("KIROCREW_BOUND_PORT", "6123")
-        monkeypatch.delenv("KIROCREW_BIND", raising=False)
+        monkeypatch.delenv("KIROCREW_BOUND_HOST", raising=False)
         assert gateway_listener() == ("127.0.0.1", 6123)
-        monkeypatch.setenv("KIROCREW_BIND", "0.0.0.0")
-        assert gateway_listener() == ("127.0.0.1", 6123)
-        monkeypatch.setenv("KIROCREW_BIND", "::")
+        monkeypatch.setenv("KIROCREW_BOUND_HOST", "::1")
         assert gateway_listener() == ("::1", 6123)
         # The relay ingress honours a hand-off over loopback only.
-        monkeypatch.setenv("KIROCREW_BIND", "10.0.0.5")
+        monkeypatch.setenv("KIROCREW_BOUND_HOST", "10.0.0.5")
         with pytest.raises(RelaySettingsError):
             gateway_listener()
-        monkeypatch.delenv("KIROCREW_BIND")
+        monkeypatch.delenv("KIROCREW_BOUND_HOST")
         monkeypatch.delenv("KIROCREW_BOUND_PORT")
         with pytest.raises(RelaySettingsError):
             gateway_listener()
 
+    @pytest.mark.parametrize("asked", ["::1", "10.0.0.5", "0.0.0.0", ""])
+    def test_the_gateway_listener_is_the_address_actually_bound_not_the_one_asked(
+        self, monkeypatch, asked
+    ) -> None:
+        # The bind policy can refuse KIROCREW_BIND and bind 127.0.0.1 instead. The
+        # relay hands requests, and the handover credential, to the socket that
+        # was bound, never to the address that was asked for.
+        import socket
+
+        from kiro_crew.dashboard.server_runtime.listener import _export_reserved_bind_evidence
+
+        monkeypatch.setenv("KIROCREW_BIND", asked)
+        monkeypatch.delenv("KIROCREW_BOUND_PORT", raising=False)
+        monkeypatch.delenv("KIROCREW_BOUND_HOST", raising=False)
+        with socket.socket() as bound:
+            bound.bind(("127.0.0.1", 0))
+            _export_reserved_bind_evidence(bound)
+            assert gateway_listener() == ("127.0.0.1", bound.getsockname()[1])
+
     @pytest.mark.parametrize(
-        ("bind", "host"),
+        ("exported", "host"),
         [
             ("127.0.0.2", "127.0.0.2"),
             ("0:0:0:0:0:0:0:1", "::1"),
-            ("[::1]", "::1"),
-            ("::", "::1"),
-            ("0.0.0.0", "127.0.0.1"),
-            ("localhost", "127.0.0.1"),
-            ("0:0:0:0:0:0:0:0", "::1"),
-            ("[::]", "::1"),
+            ("::1", "::1"),
             ("", "127.0.0.1"),
-            ("*", "127.0.0.1"),
         ],
     )
-    def test_the_gateway_listener_uses_address_identity(self, monkeypatch, bind, host) -> None:
+    def test_the_gateway_listener_uses_address_identity(self, monkeypatch, exported, host) -> None:
         monkeypatch.setenv("KIROCREW_BOUND_PORT", "6123")
-        monkeypatch.setenv("KIROCREW_BIND", bind)
+        monkeypatch.setenv("KIROCREW_BOUND_HOST", exported)
         assert gateway_listener() == (host, 6123)
 
     @pytest.mark.parametrize(
-        "bind",
+        "exported",
         ["10.0.0.5", "my-host", "::ffff:127.0.0.1", "127.0.0.1.example", "[::1"],
     )
-    def test_the_gateway_listener_refuses_non_loopback_binds(self, monkeypatch, bind) -> None:
+    def test_the_gateway_listener_refuses_non_loopback_binds(self, monkeypatch, exported) -> None:
         monkeypatch.setenv("KIROCREW_BOUND_PORT", "6123")
-        monkeypatch.setenv("KIROCREW_BIND", bind)
-        with pytest.raises(RelaySettingsError, match="KIROCREW_BIND"):
+        monkeypatch.setenv("KIROCREW_BOUND_HOST", exported)
+        with pytest.raises(RelaySettingsError, match="the gateway is bound to"):
             gateway_listener()
 
 
@@ -426,7 +437,7 @@ class TestThroughTheTunnelWrapper:
         from kiro_crew.relay_client import provider as provider_mod
 
         monkeypatch.setenv("KIROCREW_BOUND_PORT", "6123")
-        monkeypatch.delenv("KIROCREW_BIND", raising=False)
+        monkeypatch.delenv("KIROCREW_BOUND_HOST", raising=False)
         monkeypatch.setattr(provider_mod, "_gateway_ingress", RelayIngress(enabled=True))
         provider = RelayTunnelProvider(RelaySettings.from_config(_cfg(relay_enabled=True)))
         await provider.start()
