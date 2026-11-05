@@ -1127,6 +1127,70 @@ async def _close_slot(
         await close_work_item_for_slot(name)
 
 
+def _is_conductor_root(state: DashboardState, key: str) -> bool:
+    """Whether live slot *key* is a conductor: an Ultra Mode root or a Bot thread.
+
+    The same stamps the slot list writes, so a plain chat that opened a session of
+    its own is not one and keeps that session on close. No I/O; ``False`` on a fault.
+    """
+    try:
+        from kiro_crew import crew_mode
+        from kiro_crew.dashboard.session_control_parts.crew_filing import _frame_parents
+
+        rows = crew_mode.live_stamp_rows(
+            state._slots, _frame_parents(state), settled=crew_mode.lineage_is_settled()
+        )
+        row = rows.get(key)
+        if row is None:
+            return False
+        if row.get(crew_mode.ROOT_FIELD):
+            return True
+        # A Bot thread another root dispatched is that root's member, not a root.
+        nested = row.get(crew_mode.MATE_ROOT_FIELD) or row.get(crew_mode.WORKER_FIELD)
+        return crew_mode._row_is_mate_root(row) and not nested
+    except Exception:
+        logger.debug("Could not tell whether %s is a conductor", key, exc_info=True)
+        return False
+
+
+async def _close_managed(state: DashboardState, root_key: str) -> "tuple[list[str], list[str]]":
+    """Close the open sessions a just-closed *root_key* still manages, down the line.
+
+    Runs after *root_key*'s close committed, so its hand-back has already run: a
+    session it handed up the manager line, or gave back to another creator, no
+    longer names it and stays open. Each pass reads the live slots again, so a
+    session opened while an earlier one was closing is found too. Only a manager
+    that actually closed passes its line on. Returns ``(closed, failed)`` keys.
+    """
+    from kiro_crew.dashboard import session_managers
+
+    await asyncio.to_thread(session_managers.load)
+    managers = {root_key}
+    tried: set[str] = set()
+    closed: list[str] = []
+    failed: list[str] = []
+    while True:
+        layer = [
+            s
+            for s in list(state._slots.values())
+            if s.key not in tried and session_managers.holder(s) in managers
+        ]
+        if not layer:
+            return closed, failed
+        for child in layer:
+            tried.add(child.key)
+            if state.get_slot(child.key) is not child:
+                continue
+            try:
+                await close_slot(state, child, child.key, hand_back=False)
+            except Exception as exc:
+                logger.warning("Closing worker %s with its manager failed: %s", child.key, exc)
+                failed.append(child.key)
+            else:
+                closed.append(child.key)
+                managers.add(child.key)
+
+
 async def api_chat_slot_delete(request: web.Request) -> web.Response:
     """DELETE /api/chat/slots/{slot} — stop and remove a UI slot.
 
@@ -1137,6 +1201,12 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
     session-control's ``close_target``; this handler adds only the
     DELETE-endpoint's App Kit ownership check and maps the outcome to a
     response.
+
+    When the person closes a conductor (an Ultra Mode root or a Bot thread, no
+    app token), the open sessions it manages close with it, down the whole line.
+    Any other session keeps the sessions it opened. A worker left behind a closed
+    conductor can neither be steered nor report to anyone. A worker that fails
+    to close stays open and is named in ``failed_workers``.
     """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
@@ -1147,10 +1217,13 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
     # App ownership check (App Kit §5.2): app can only delete slots it created.
     # Unscoped slots (empty _app) cannot be deleted by app tokens.
     # Dashboard users (empty request_app) can delete anything.
-    denied = deny_app_slot_access(request.get("app", ""), slot, name, "slot_delete")
+    request_app = request.get("app", "")
+    denied = deny_app_slot_access(request_app, slot, name, "slot_delete")
     if denied is not None:
         return denied
 
+    # Read while the slot is still live: its stamps need it in the slot table.
+    conductor = not request_app and _is_conductor_root(state, name)
     try:
         await close_slot(state, slot, name)
     except SlotCloseError as exc:
@@ -1161,7 +1234,10 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
         # The pre-pop re-check that raises other statuses is session-control's
         # path, not this handler's.
         return web.json_response({"error": exc.message, "code": exc.code}, status=500)
-    return web.json_response({"ok": True})
+    closed, failed = await _close_managed(state, name) if conductor else ([], [])
+    if not closed and not failed:
+        return web.json_response({"ok": True})
+    return web.json_response({"ok": True, "closed_workers": closed, "failed_workers": failed})
 
 
 async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
