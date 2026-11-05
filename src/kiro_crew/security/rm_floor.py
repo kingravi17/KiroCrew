@@ -12,6 +12,7 @@ from ..trust_patterns import ENV_ASSIGNMENT_RE
 from . import shell_commands as _commands
 from . import shell_normalizer as _shell
 from .denied_rules import BUILTIN_DENIED_RULES
+from .shell_normalizer_escapes import _ANSI_C_QUOTE_RE
 
 _RM_FLOOR_RULE_IDS = {
     "root": "local-destructive-rm-rf-root",
@@ -90,7 +91,7 @@ def _segments(command: str, track: bool = True) -> "list[str]":
     out = []
     # ``&>`` is one redirect in bash but a background ``&`` then ``>`` in dash
     for text in dict.fromkeys((command, command.replace("&>", "& >"))):
-        for cmd in _commands.read_commands(text, track):
+        for cmd in _commands.read_commands(text, track, heredocs=True):
             seg: list[str] = []
             for step in cmd.steps:
                 if step.redirect:
@@ -169,16 +170,23 @@ def _after_shell_verb(tokens: "list[str]", programs: "list[str]", index: int) ->
 
 
 def _command_lines(text: str) -> "list[str]":
-    """*text* cut at each live newline, a comment cut off; it ends after a live ``<<``
-    heredoc line (not a ``<<<`` herestring), whose body is data."""
+    """*text* without its heredoc bodies (data unless fed to a shell, see
+    :func:`_heredoc_payloads`), cut at each live newline, a comment cut off."""
+    commands = _commands.read_commands(text, heredocs=True) if "<<" in text else []
+    spans: list[list[int]] = []  # a body nested in another body's substitution merges
+    for start, end in sorted((d.start, d.end) for c in commands for d in c.heredocs):
+        if spans and start <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], end)
+        else:
+            spans.append([start, end])
+    for start, end in reversed(spans):
+        text = text[:start] + text[end:]
     lines: list[str] = []
-    pos, heredoc = 0, False
-    while pos <= len(text) and not heredoc:
+    pos = 0
+    while pos <= len(text):
         rest, cut, end = text[pos:], len(text), len(text)
         for step in _shell._iter_shell_chars(rest):
             at = step.offset
-            if step.active and rest.startswith("<<", at):
-                heredoc = heredoc or not (rest.startswith("<<<", at) or rest[at - 1 : at] == "<")
             if step.active and step.char == "#" and _shell._opens_comment(rest, at):
                 newline = rest.find("\n", at)
                 cut, end = pos + at, len(text) if newline < 0 else pos + newline
@@ -189,6 +197,76 @@ def _command_lines(text: str) -> "list[str]":
         lines.append(text[pos:cut])
         pos = end + 1
     return lines
+
+
+def _heredoc_payloads(command: str) -> "list[str]":
+    """Each heredoc body a shell reads as its script (``bash <<EOF``, ``cat <<EOF | sh``),
+    and each command read from a substitution in an unquoted body, which bash runs."""
+    commands = _commands.read_commands(command, heredocs=True)
+    docs = [d for c in commands for d in c.heredocs if not d.quoted]
+    out: list[str] = []
+    for i, cmd in enumerate(commands):
+        if cmd.steps and any(d.start <= cmd.steps[0].start < d.end for d in docs):
+            out.append(command[cmd.steps[0].start : cmd.steps[-1].end])
+        if cmd.heredocs and (
+            _runs_shell(cmd)
+            or cmd.separator == "|"
+            and i + 1 < len(commands)
+            and _runs_shell(commands[i + 1])
+        ):
+            out.extend(doc.body for doc in cmd.heredocs)
+    return out
+
+
+def _runs_shell(cmd: "_commands.ShellCommand") -> bool:
+    """*cmd* is a shell reading its script from stdin (``bash``, ``sudo -u x sh -s``): the
+    program, or a wrapper's, is a shell given no ``-c`` and no script file."""
+    words = _shell._shell_tokens(" ".join(word.raw for word in cmd.argv))
+    words = [w for w in words if not ENV_ASSIGNMENT_RE.match(w)]
+    if not words or _shell._program_basename(words[0]) not in _STDIN_WRAPPERS | _LITERAL_SHELLS:
+        return False
+    for i, word in enumerate(words):
+        if _shell._program_basename(word) in _LITERAL_SHELLS:
+            rest, reads_stdin = iter(words[i + 1 :]), True
+            for arg in rest:
+                if (
+                    arg in _SHELL_VALUE_OPTIONS
+                    or arg[:1] in "-+"
+                    and arg[1:2] != "-"
+                    and arg[-1:] in "oO"
+                ):
+                    next(rest, None)  # ``-o posix``, ``-euo pipefail``
+                elif _shell._is_shell_command_flag(arg) or not arg[:1] in "-+":
+                    reads_stdin = False  # ``-c`` or a script file: stdin is its data
+                    break
+                elif arg[:1] == "-" and arg[1:2] != "-" and "s" in arg:
+                    break  # ``-s``: the script is stdin, later words are its arguments
+            if reads_stdin:
+                return True
+    return False
+
+
+#: Programs that run the command after them: the heredoc reaches that command's stdin.
+_STDIN_WRAPPERS = frozenset(
+    {"sudo", "doas", "env", "nice", "nohup", "time", "command", "exec", "timeout", "stdbuf"}
+    | {"chroot", "setsid", "nsenter", "unshare", "runuser", "su", "ionice", "flock"}
+    | {"taskset", "chrt", "busybox"}
+)
+#: Shell options that take the next word as their value (``-o posix``).
+_SHELL_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
+
+
+def _ansi_c_newlines(command: str) -> str:
+    """*command* with each ``\\n`` escape in a ``$'…'`` span as a real newline. The
+    tokenizer reads that escape as a blank, but a nested shell given it reads a new line."""
+
+    def keep(match: "re.Match[str]") -> str:
+        if match.group(1) is None:
+            return match.group(0)
+        body = re.sub(r"\\(.)", lambda m: "\n" if m.group(1) == "n" else m.group(0), match.group(1))
+        return "$'" + body + "'"
+
+    return _ANSI_C_QUOTE_RE.sub(keep, command)
 
 
 def _expands_nothing(command: str) -> bool:
@@ -246,7 +324,12 @@ def _rm_wipe_targets_nested(command: str) -> "set[str]":
         kinds |= _rm_wipe_targets(source)
         folded = _shell._fold_line_continuations(source)
         kinds |= _rm_wipe_targets(folded) if folded != source else set()  # bash folds them
-        for tokens in _command_tokens(source):
+        for payload in _heredoc_payloads(source) if "<<" in source else ():
+            if len(payload) < len(source) and payload not in seen:
+                seen.add(payload)
+                pending.append(payload)
+        views = (source, _ansi_c_newlines(source)) if "$'" in source else (source,)
+        for tokens in (t for view in dict.fromkeys(views) for t in _command_tokens(view)):
             payloads = _shell._nested_shell_payloads(tokens, allow_join=False)
             if not payloads:
                 continue
