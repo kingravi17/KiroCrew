@@ -114,6 +114,7 @@ _FORBIDDEN_SUBCOMMANDS: dict[str, tuple[tuple[str, ...], ...]] = {
         ("api",),  # can PATCH/POST anything the token reaches
         ("secret",),
         ("workflow", "run"),
+        ("repo", "delete"),
     ),
     "git": (
         ("push",),
@@ -263,6 +264,18 @@ def _refusal(text: str, *, depth: int) -> str:
                         return reason
                     break
             # Fall through: a shell invoked WITHOUT -c still gets its own args checked below.
+
+        # `eval` joins its arguments and runs them as a script. Re-check that script
+        # whole, before any option or VAR=value stripping: the wrapper path would drop
+        # a quoted script word that holds `=` (`eval 'GH_TOKEN=x gh repo delete'`).
+        if binary == "eval":
+            script = words[1:]
+            if script[:1] == ["--"]:
+                script = script[1:]
+            reason = _refusal(" ".join(script), depth=depth + 1)
+            if reason:
+                return reason
+            continue
 
         # A wrapper runs the command that follows it, so check that command instead.
         if binary in _COMMAND_WRAPPERS:
