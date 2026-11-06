@@ -14,6 +14,7 @@ from kiro_crew.dashboard.state import (
     DashboardState,
     _ChatSlot,
 )
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 @pytest.fixture
@@ -24,6 +25,23 @@ def loop():
     yield new_loop
     new_loop.close()
     asyncio.set_event_loop(None)
+
+
+class _FakeClock:
+    """Stands in for ``_slots_broadcast_clock``; moves only when a test says so."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = _FakeClock()
+    monkeypatch.setattr("kiro_crew.dashboard.state._slots_broadcast_clock", fake)
+    return fake
 
 
 @pytest.fixture
@@ -45,11 +63,18 @@ def state(monkeypatch, tmp_path, loop):
 class TestBurstCoalescing:
     """A burst of N rapid calls produces exactly 1 leading + 1 trailing broadcast."""
 
-    def test_burst_produces_leading_plus_trailing(self, state, loop):
+    def test_burst_produces_leading_plus_trailing(self, state, loop, clock):
         broadcasts: list[dict] = []
+        timers: list[tuple[float, object]] = []
+
+        def capture_later(delay, callback, *args, **kwargs):
+            timers.append((delay, callback))
+            return MagicMock()
+
         state._broadcast = lambda note: broadcasts.append(note)
 
         async def _run_burst():
+            loop.call_later = capture_later  # type: ignore[method-assign]
             state.push_slots_update()
             assert len(broadcasts) == 1, "Leading edge should broadcast immediately"
 
@@ -57,10 +82,13 @@ class TestBurstCoalescing:
                 state.push_slots_update()
             assert len(broadcasts) == 1, "Burst within window should not add broadcasts"
 
-            await asyncio.sleep(_SLOTS_BROADCAST_INTERVAL_S + 0.05)
-            assert len(broadcasts) == 2, (
-                f"Expected exactly 1 trailing broadcast after timer, got {len(broadcasts)}"
-            )
+            # Advance clock past the interval and fire the armed trailing timer.
+            assert len(timers) == 1, "Burst must arm exactly one trailing timer"
+            clock.now = _SLOTS_BROADCAST_INTERVAL_S
+            timers[0][1]()
+            assert (
+                len(broadcasts) == 2
+            ), f"Expected exactly 1 trailing broadcast after timer, got {len(broadcasts)}"
 
         loop.run_until_complete(_run_burst())
 
@@ -68,26 +96,36 @@ class TestBurstCoalescing:
 class TestTrailingCarriesLatestState:
     """The trailing broadcast carries the LATEST state, not a stale snapshot."""
 
-    def test_trailing_reflects_mutation(self, state, loop):
+    def test_trailing_reflects_mutation(self, state, loop, clock):
         payloads: list[dict] = []
+        timers: list[tuple[float, object]] = []
+
+        def capture_later(delay, callback, *args, **kwargs):
+            timers.append((delay, callback))
+            return MagicMock()
+
         state._broadcast = lambda note: payloads.append(note)
 
         slot = _ChatSlot("test-1-100", title="before")
         state._slots["test-1-100"] = slot
 
         async def _run():
+            loop.call_later = capture_later  # type: ignore[method-assign]
             state.push_slots_update()
             assert len(payloads) == 1
             assert any(s["title"] == "before" for s in payloads[0]["_slots_list"])
 
             slot.title = "after"
             state.push_slots_update()
+            assert len(timers) == 1
 
-            await asyncio.sleep(_SLOTS_BROADCAST_INTERVAL_S + 0.05)
+            # Advance clock past the interval and fire the trailing timer.
+            clock.now = _SLOTS_BROADCAST_INTERVAL_S
+            timers[0][1]()
             assert len(payloads) == 2
-            assert any(s["title"] == "after" for s in payloads[1]["_slots_list"]), (
-                "Trailing broadcast must carry the latest (mutated) state"
-            )
+            assert any(
+                s["title"] == "after" for s in payloads[1]["_slots_list"]
+            ), "Trailing broadcast must carry the latest (mutated) state"
 
         loop.run_until_complete(_run())
 
@@ -131,15 +169,30 @@ class TestSuspendTakesPriority:
 class TestNonEventLoopThread:
     """Calling from a non-event-loop thread does not raise and does not lose."""
 
-    def test_cross_thread_call(self, state, loop):
+    def test_cross_thread_call(self, state, loop, clock):
         broadcasts: list[dict] = []
-        state._broadcast = lambda note: broadcasts.append(note)
+        broadcast_event = asyncio.Event()
+        timers: list[tuple[float, object]] = []
 
-        # Prime the window: with a RECENT last-broadcast the worker thread cannot
-        # take the leading edge, so it must reach the threadsafe scheduling path.
-        state._slots_broadcast_last = time.monotonic()
+        def capture_later(delay, callback, *args, **kwargs):
+            timers.append((delay, callback))
+            return MagicMock()
+
+        def on_broadcast(note):
+            broadcasts.append(note)
+            loop.call_soon_threadsafe(broadcast_event.set)
+
+        state._broadcast = on_broadcast
+
+        # Prime the window from the fake clock so elapsed=0 and the worker
+        # thread takes the threadsafe scheduling path, not a leading edge.
+        state._slots_broadcast_last = clock.now
 
         errors: list[Exception] = []
+
+        # Install capture_later before the thread starts so the call_later
+        # from _schedule_trailing_flush is intercepted when it lands.
+        loop.call_later = capture_later  # type: ignore[method-assign]
 
         def worker():
             try:
@@ -154,14 +207,21 @@ class TestNonEventLoopThread:
         assert not errors, f"Cross-thread call raised: {errors}"
         assert broadcasts == [], "In-window cross-thread call must not broadcast inline"
 
-        # Drive the loop so call_soon_threadsafe runs _schedule_trailing_flush.
-        loop.run_until_complete(asyncio.sleep(0.05))
-        assert state._slots_broadcast_timer is not None, (
-            "_schedule_trailing_flush must have armed the trailing timer"
-        )
+        async def _run():
+            # Wait for call_soon_threadsafe to deliver _schedule_trailing_flush,
+            # which arms the trailing timer via capture_later.
+            await async_wait_until(lambda: len(timers) > 0)
+            assert (
+                state._slots_broadcast_timer is not None
+            ), "_schedule_trailing_flush must have armed the trailing timer"
 
-        loop.run_until_complete(asyncio.sleep(_SLOTS_BROADCAST_INTERVAL_S + 0.1))
-        assert len(broadcasts) == 1, "Update from non-loop thread must not be lost"
+            # Advance clock past the interval and fire the captured callback.
+            clock.now = _SLOTS_BROADCAST_INTERVAL_S
+            timers[0][1]()
+            await await_until(broadcast_event)
+            assert len(broadcasts) == 1, "Update from non-loop thread must not be lost"
+
+        loop.run_until_complete(_run())
 
     def test_dead_loop_falls_back_to_inline_broadcast(self, state):
         """Negative control: with no usable loop the update is still delivered."""
@@ -175,7 +235,7 @@ class TestNonEventLoopThread:
 
         state.push_slots_update()
 
-        assert len(broadcasts) == 1, (
-            "A closed loop must degrade to an inline broadcast, not silently drop"
-        )
+        assert (
+            len(broadcasts) == 1
+        ), "A closed loop must degrade to an inline broadcast, not silently drop"
         assert state._slots_broadcast_timer is None, "No timer can be armed on a closed loop"
