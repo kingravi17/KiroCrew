@@ -992,12 +992,21 @@ def session_mcp_server_is_disabled(
     HAS the parse uses :func:`session_mcp_disabled_servers` instead and keeps its
     answers on one read.
 
-    Blocking (reads the agent spec and the global settings file); callers run it off
-    the event loop. Never raises: an unreadable source switches nothing off, the same
-    contract :func:`session_mcp_disabled_tools` keeps.
+    Blocking (reads the agent spec, global settings, and crew store); callers run it
+    off the event loop. Never raises: an unreadable source switches nothing off, the
+    same contract :func:`session_mcp_disabled_tools` keeps.
     """
     spec = _agent_spec_for(agent, work_dir) if agent else None
-    return name in session_mcp_disabled_servers(spec, _global_settings())
+    # Check both the agent spec + global settings (the original two sources), and
+    # crew store (the third source that toggle writes to). This closes the gap where
+    # a server in an agent file is muted via toggle (which writes to crew store or
+    # global) but the agent file entry itself has no `disabled: true`.
+    if name in session_mcp_disabled_servers(spec, _global_settings()):
+        return True
+    from kiro_crew.mcp_cleanup import mcp_server_muted_in_any_store
+
+    agent_entry = spec.get("mcpServers", {}).get(name) if isinstance(spec, dict) else None
+    return mcp_server_muted_in_any_store(name, agent_entry)
 
 
 def session_mcp_restricted_servers(disabled_tools: Collection[tuple[str, str]]) -> frozenset[str]:
