@@ -817,9 +817,21 @@ function createGatewaySupervisor({
     // Write child stdout/stderr directly to a file descriptor. A JS pipe could
     // backpressure a long-running gateway; the descriptor also preserves Python
     // tracebacks which otherwise disappear on clean recipient machines.
+    //
+    // Windows is the exception: Node adds CREATE_NO_WINDOW to a windowsHide
+    // spawn only when no stdio entry inherits a descriptor, and without it the
+    // gateway gets a console of its own that can show and take the focus. There
+    // the child gets null stdio and the log's path instead, and its entry point
+    // re-points its own stdout/stderr at that file (kiro_crew/desktop_stdio.py).
     let childOut = "ignore";
-    try { childOut = fs.openSync(gatewayLogPath(), "a"); }
-    catch (error) { userWarn(`WARN could not open child log fd: ${error.message}`); }
+    let childLogEnv = {};
+    if (IS_WIN) {
+      const launchLog = gatewayLogPath();
+      if (launchLog) childLogEnv = { KIROCREW_DESKTOP_STDIO_LOG: launchLog };
+    } else {
+      try { childOut = fs.openSync(gatewayLogPath(), "a"); }
+      catch (error) { userWarn(`WARN could not open child log fd: ${error.message}`); }
+    }
     glog(SPAWN_MARKER);
     gatewayStartFailure = null;
 
@@ -849,6 +861,8 @@ function createGatewaySupervisor({
         // of serving the browser sign-in screen, which this window cannot open
         // yet (enterprise_signin_gateway.DESKTOP_GATEWAY_ENV).
         KIROCREW_DESKTOP_GATEWAY: "1",
+        // Windows only: where the gateway sends its stdout/stderr (see above).
+        ...childLogEnv,
         // The kiro-cli staged into the app's resources at build time; spread
         // only when it shipped AND runs on this machine, so an unbundled build,
         // or a bundled copy this host cannot execute, keeps the user's own

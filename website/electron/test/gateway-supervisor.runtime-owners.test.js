@@ -220,6 +220,36 @@ test("the spawned gateway's project dir is the Electron app's parent off Windows
   assert.deepStrictEqual(options.stdio, ["ignore", 41, 41]);
   assert.strictEqual(options.detached, false);
   assert.strictEqual(options.windowsHide, true);
+  assert.strictEqual(options.env.KIROCREW_DESKTOP_STDIO_LOG, undefined);
+});
+
+test("a Windows gateway gets null stdio and the launch log's path, so Node adds CREATE_NO_WINDOW", async () => {
+  const baseFs = harness().fsMod;
+  const opened = [];
+  const { supervisor, spawnCalls } = harness({
+    processRef: {
+      platform: "win32",
+      arch: "x64",
+      env: { KIROCREW_HOME: "/virtual/kirocrew-home" },
+      resourcesPath: "/virtual/resources",
+      kill() { throw new Error("process kill must not run in this harness"); },
+    },
+    fsMod: {
+      ...baseFs,
+      openSync(...args) { opened.push(args); return 41; },
+    },
+  });
+  assert.strictEqual(await supervisor.start(), true);
+  const [, , options] = spawnCalls[0];
+  // libuv sets CREATE_NO_WINDOW only when no stdio entry inherits a descriptor.
+  assert.deepStrictEqual(options.stdio, ["ignore", "ignore", "ignore"]);
+  assert.strictEqual(options.windowsHide, true);
+  assert.strictEqual(options.env.KIROCREW_DESKTOP_STDIO_LOG, "/virtual/logs/gateway-launch.log");
+  assert.deepStrictEqual(
+    opened.filter(([target]) => target === "/virtual/logs/gateway-launch.log"),
+    [],
+    "the shell does not hand the log to the child as a descriptor",
+  );
 });
 
 test("Windows takes the first tree above the Electron sources carrying agents and skills", async () => {
